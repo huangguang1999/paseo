@@ -46,6 +46,7 @@ import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import {
   observeClaudeToolCallProtocol,
+  readClaudeSyntheticApiError,
   visibleClaudeAssistantTextEnd,
   type ClaudeToolCallProtocolObservation,
 } from "./raw-tool-call-guard.js";
@@ -2095,6 +2096,7 @@ class ClaudeAgentSession implements AgentSession {
     { kind: "retryable" | "fatal" }
   > | null = null;
   private toolCallProtocolRetryCount = 0;
+  private syntheticApiError: string | null = null;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -3857,6 +3859,7 @@ class ClaudeAgentSession implements AgentSession {
     const identifiers = readEventIdentifiers(message);
     this.rememberTranscriptProgress(message, readTranscriptUuid(message));
     this.observeToolCallProtocol(message);
+    this.observeSyntheticApiError(message);
 
     this.logger.trace(
       {
@@ -3915,22 +3918,23 @@ class ClaudeAgentSession implements AgentSession {
       suppressAssistantText: true,
       suppressReasoning: true,
     });
-    const assistantTimelineEvents = readClaudeParentToolUseId(message)
-      ? []
-      : this.timelineAssembler
-          .consume({
-            message,
-            runId: turnId,
-            messageIdHint,
-          })
-          .map(
-            (item) =>
-              ({
-                type: "timeline",
-                item,
-                provider: "claude",
-              }) satisfies AgentStreamEvent,
-          );
+    const assistantTimelineEvents =
+      readClaudeParentToolUseId(message) || readClaudeSyntheticApiError(message)
+        ? []
+        : this.timelineAssembler
+            .consume({
+              message,
+              runId: turnId,
+              messageIdHint,
+            })
+            .map(
+              (item) =>
+                ({
+                  type: "timeline",
+                  item,
+                  provider: "claude",
+                }) satisfies AgentStreamEvent,
+            );
 
     return [...messageEvents, ...assistantTimelineEvents];
   }
@@ -4416,6 +4420,11 @@ class ClaudeAgentSession implements AgentSession {
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
     if (message.subtype === "success") {
+      if (this.syntheticApiError) {
+        events.push(...this.sidechainTracker.finishAll("failed"));
+        events.push(this.buildTurnFailedEvent(this.syntheticApiError));
+        return;
+      }
       if (this.toolCallProtocolIssue) {
         const issue = this.toolCallProtocolIssue;
         if (
@@ -4482,6 +4491,11 @@ class ClaudeAgentSession implements AgentSession {
     this.toolCallProtocolIssue = observation;
   }
 
+  private observeSyntheticApiError(message: SDKMessage): void {
+    const error = readClaudeSyntheticApiError(message);
+    if (error) this.syntheticApiError = error;
+  }
+
   private enqueueToolCallProtocolRetry(): boolean {
     if (!this.input) return false;
     const retryMessage = {
@@ -4497,6 +4511,7 @@ class ClaudeAgentSession implements AgentSession {
   private resetToolCallProtocolGuard(): void {
     this.toolCallProtocolIssue = null;
     this.toolCallProtocolRetryCount = 0;
+    this.syntheticApiError = null;
   }
 
   private createClaudeSessionChangedNotice(

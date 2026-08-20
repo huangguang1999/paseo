@@ -1375,6 +1375,82 @@ test("fails closed when raw and structured tool names disagree", async () => {
   }
 });
 
+test("fails closed when Claude Code wraps an upstream protocol error as synthetic text", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        const messages: Record<string, unknown>[] = [
+          {
+            type: "system",
+            subtype: "init",
+            session_id: "synthetic-api-error-session",
+            permissionMode: "default",
+            model: "mock-raw-invoke",
+          },
+          {
+            type: "assistant",
+            message: {
+              id: "msg-visible-prefix",
+              role: "assistant",
+              content: [{ type: "text", text: "Running.\n" }],
+              usage: { input_tokens: 5, output_tokens: 0 },
+            },
+          },
+          {
+            type: "assistant",
+            message: {
+              id: "msg-synthetic-api-error",
+              model: "<synthetic>",
+              role: "assistant",
+              stop_reason: "stop_sequence",
+              usage: { input_tokens: 0, output_tokens: 0 },
+              content: [
+                {
+                  type: "text",
+                  text: "API Error: Upstream returned malformed tool-call content",
+                },
+              ],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            session_id: "synthetic-api-error-session",
+            usage: buildUsage({ output_tokens: 0 }),
+            total_cost_usd: 0,
+          },
+        ];
+        if (step >= messages.length) return { done: true, value: undefined };
+        return { done: false, value: messages[step++] };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the check"));
+    const assistantText = events
+      .filter(
+        (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+          event.type === "timeline" && event.item.type === "assistant_message",
+      )
+      .map((event) => event.item.text)
+      .join("");
+    const failure = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+
+    expect(failure?.error).toBe("API Error: Upstream returned malformed tool-call content");
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    expect(assistantText).toBe("Running.\n");
+    expect(assistantText).not.toContain("API Error:");
+  } finally {
+    await session.close();
+  }
+});
+
 test("preserves bypass capability across query restarts triggered by thinking changes", async () => {
   const capturedOptions: Array<{
     permissionMode?: string;

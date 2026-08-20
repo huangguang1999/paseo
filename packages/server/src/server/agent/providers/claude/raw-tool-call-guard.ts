@@ -86,3 +86,24 @@ export function visibleClaudeAssistantTextEnd(text: string, stopped: boolean): n
   }
   return text.length;
 }
+
+export function readClaudeSyntheticApiError(message: unknown): string | null {
+  const outer = toRecord(message);
+  if (outer?.type !== "assistant") return null;
+  const container = toRecord(outer.message);
+  if (container?.model !== "<synthetic>") return null;
+  const usage = toRecord(container.usage);
+  if (usage?.output_tokens !== 0) return null;
+  if (!Array.isArray(container.content)) return null;
+
+  const text = container.content
+    .map((value) => toRecord(value))
+    .filter(
+      (block): block is Record<string, unknown> =>
+        block?.type === "text" && typeof block.text === "string",
+    )
+    .map((block) => block.text as string)
+    .join("")
+    .trim();
+  return text.startsWith("API Error:") ? text : null;
+}
