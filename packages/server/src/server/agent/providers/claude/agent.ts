@@ -44,6 +44,11 @@ import {
 } from "./model-manifest.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
+import {
+  observeClaudeToolCallProtocol,
+  visibleClaudeAssistantTextEnd,
+  type ClaudeToolCallProtocolObservation,
+} from "./raw-tool-call-guard.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
   ClaudeTaskProtocolSource,
@@ -1278,13 +1283,17 @@ class TimelineAssembler {
 
   private emitNewContent(state: TimelineMessageState): AgentTimelineItem[] {
     const items: AgentTimelineItem[] = [];
-    const nextAssistantText = state.assistantText.slice(state.emittedAssistantLength);
+    const visibleAssistantEnd = visibleClaudeAssistantTextEnd(state.assistantText, state.stopped);
+    const nextAssistantText = state.assistantText.slice(
+      state.emittedAssistantLength,
+      visibleAssistantEnd,
+    );
     if (
       nextAssistantText.length > 0 &&
       nextAssistantText !== INTERRUPT_TOOL_USE_PLACEHOLDER &&
       !isClaudeTranscriptNoiseText(nextAssistantText)
     ) {
-      state.emittedAssistantLength = state.assistantText.length;
+      state.emittedAssistantLength = visibleAssistantEnd;
       items.push({ type: "assistant_message", text: nextAssistantText, messageId: state.id });
     }
 
@@ -2081,6 +2090,11 @@ class ClaudeAgentSession implements AgentSession {
   private pendingInterruptAbort = false;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
+  private toolCallProtocolIssue: Extract<
+    ClaudeToolCallProtocolObservation,
+    { kind: "retryable" | "fatal" }
+  > | null = null;
+  private toolCallProtocolRetryCount = 0;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2219,6 +2233,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundTurnId = turnId;
     this.foregroundHasVisibleActivity = false;
     this.activeTurnHasAssistantText = false;
+    this.resetToolCallProtocolGuard();
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3553,6 +3568,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundInput = null;
     this.cancelCurrentTurn = null;
     this.activeTurnHasAssistantText = false;
+    this.resetToolCallProtocolGuard();
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3570,12 +3586,14 @@ class ClaudeAgentSession implements AgentSession {
         this.activeForegroundInput = null;
         this.cancelCurrentTurn = null;
         this.activeTurnHasAssistantText = false;
+        this.resetToolCallProtocolGuard();
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
         this.activeForegroundQuery = null;
         this.activeForegroundInput = null;
         this.activeTurnHasAssistantText = false;
+        this.resetToolCallProtocolGuard();
         this.syncTurnState("autonomous turn terminal");
       }
     }
@@ -3591,6 +3609,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = this.query;
     this.activeForegroundInput = this.input;
     this.activeTurnHasAssistantText = false;
+    this.resetToolCallProtocolGuard();
     this.contextUsage.beginTurn();
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
     this.syncTurnState("autonomous turn started");
@@ -3605,6 +3624,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
     this.activeTurnHasAssistantText = false;
+    this.resetToolCallProtocolGuard();
     this.syncTurnState("autonomous turn completed");
   }
 
@@ -3836,6 +3856,7 @@ class ClaudeAgentSession implements AgentSession {
     const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
     const identifiers = readEventIdentifiers(message);
     this.rememberTranscriptProgress(message, readTranscriptUuid(message));
+    this.observeToolCallProtocol(message);
 
     this.logger.trace(
       {
@@ -4395,6 +4416,29 @@ class ClaudeAgentSession implements AgentSession {
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
     if (message.subtype === "success") {
+      if (this.toolCallProtocolIssue) {
+        const issue = this.toolCallProtocolIssue;
+        if (
+          issue.kind === "retryable" &&
+          this.toolCallProtocolRetryCount === 0 &&
+          this.enqueueToolCallProtocolRetry()
+        ) {
+          this.toolCallProtocolRetryCount = 1;
+          this.logger.warn(
+            { reason: issue.reason },
+            "Retrying malformed Claude tool-call protocol once",
+          );
+          return;
+        }
+        events.push(...this.sidechainTracker.finishAll("failed"));
+        const retrySuffix = this.toolCallProtocolRetryCount > 0 ? " after one retry" : "";
+        events.push(
+          this.buildTurnFailedEvent(
+            `Claude returned malformed tool-call protocol${retrySuffix}: ${issue.reason}`,
+          ),
+        );
+        return;
+      }
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
       // run client-side in the Claude CLI with no model turn — output_tokens
@@ -4423,6 +4467,36 @@ class ClaudeAgentSession implements AgentSession {
         : "Claude run failed";
     events.push(...this.sidechainTracker.finishAll("failed"));
     events.push(this.buildTurnFailedEvent(errorMessage));
+  }
+
+  private observeToolCallProtocol(message: SDKMessage): void {
+    if (readClaudeParentToolUseId(message)) return;
+    const observation = observeClaudeToolCallProtocol(message);
+    if (observation.kind === "none") return;
+    if (observation.kind === "recovered") {
+      if (this.toolCallProtocolIssue?.kind !== "fatal") {
+        this.toolCallProtocolIssue = null;
+      }
+      return;
+    }
+    this.toolCallProtocolIssue = observation;
+  }
+
+  private enqueueToolCallProtocolRetry(): boolean {
+    if (!this.input) return false;
+    const retryMessage = {
+      ...this.toSdkUserMessage(
+        "Your tool call was malformed and could not be parsed. Retry once using one structured tool call only.",
+      ),
+      isMeta: true,
+    };
+    this.input.push(retryMessage);
+    return true;
+  }
+
+  private resetToolCallProtocolGuard(): void {
+    this.toolCallProtocolIssue = null;
+    this.toolCallProtocolRetryCount = 0;
   }
 
   private createClaudeSessionChangedNotice(

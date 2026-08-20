@@ -985,6 +985,396 @@ test("captures Claude stderr in the turn failure diagnostic when stderr arrives 
   }
 });
 
+test("suppresses split raw invoke text when the same response has a structured tool call", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        const messages: Record<string, unknown>[] = [
+          {
+            type: "system",
+            subtype: "init",
+            session_id: "raw-invoke-duplicate-session",
+            permissionMode: "default",
+            model: "opus",
+          },
+          {
+            type: "stream_event",
+            message_id: "msg-raw-duplicate",
+            event: {
+              type: "message_start",
+              message: { id: "msg-raw-duplicate" },
+            },
+          },
+          {
+            type: "stream_event",
+            message_id: "msg-raw-duplicate",
+            event: {
+              type: "content_block_start",
+              content_block: { type: "text", text: "" },
+            },
+          },
+          {
+            type: "stream_event",
+            message_id: "msg-raw-duplicate",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Running.\n<inv" },
+            },
+          },
+          {
+            type: "stream_event",
+            message_id: "msg-raw-duplicate",
+            event: {
+              type: "content_block_delta",
+              delta: {
+                type: "text_delta",
+                text: 'oke name="Bash"><parameter name="command">printf test</parameter></invoke>',
+              },
+            },
+          },
+          {
+            type: "assistant",
+            message: {
+              id: "msg-raw-duplicate",
+              role: "assistant",
+              stop_reason: "tool_use",
+              content: [
+                {
+                  type: "text",
+                  text: 'Running.\n<invoke name="Bash"><parameter name="command">printf test</parameter></invoke>',
+                },
+                {
+                  type: "tool_use",
+                  id: "toolu-raw-duplicate",
+                  name: "Bash",
+                  input: { command: "printf test" },
+                },
+              ],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            session_id: "raw-invoke-duplicate-session",
+            usage: buildUsage(),
+            total_cost_usd: 0,
+          },
+        ];
+        if (step >= messages.length) return { done: true, value: undefined };
+        return { done: false, value: messages[step++] };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the check"));
+    const assistantText = events
+      .filter(
+        (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+          event.type === "timeline" && event.item.type === "assistant_message",
+      )
+      .map((event) => event.item.text)
+      .join("");
+    const toolCalls = events.filter(
+      (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+        event.type === "timeline" && event.item.type === "tool_call",
+    );
+
+    expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(assistantText).toBe("Running.\n");
+    expect(assistantText).not.toContain("<invoke");
+    expect(toolCalls.some((event) => event.item.name === "Bash")).toBe(true);
+  } finally {
+    await session.close();
+  }
+});
+
+test("retries one raw-only tool call invisibly and completes after structured recovery", async () => {
+  const retryMessages: unknown[] = [];
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const promptIterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          const initialPrompt = await promptIterator.next();
+          if (initialPrompt.done) return { done: true, value: undefined };
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "raw-invoke-retry-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: {
+                id: "msg-raw-only-first",
+                role: "assistant",
+                stop_reason: "end_turn",
+                content: [
+                  {
+                    type: "text",
+                    text: '<invoke name="Bash"><parameter name="command">printf test</parameter></invoke>',
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              session_id: "raw-invoke-retry-session",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          const retryPrompt = await promptIterator.next();
+          if (retryPrompt.done) return { done: true, value: undefined };
+          retryMessages.push(retryPrompt.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: {
+                id: "msg-raw-only-recovered",
+                role: "assistant",
+                stop_reason: "tool_use",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu-raw-only-recovered",
+                    name: "Bash",
+                    input: { command: "printf test" },
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (step === 4) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              session_id: "raw-invoke-retry-session",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the check"));
+    const assistantText = events
+      .filter(
+        (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+          event.type === "timeline" && event.item.type === "assistant_message",
+      )
+      .map((event) => event.item.text)
+      .join("");
+
+    expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(assistantText).not.toContain("<invoke");
+    expect(retryMessages).toHaveLength(1);
+    expect(retryMessages[0]).toMatchObject({ isMeta: true });
+  } finally {
+    await session.close();
+  }
+});
+
+test("fails after one raw-only retry instead of reporting a false success", async () => {
+  const retryMessages: unknown[] = [];
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const promptIterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          const initialPrompt = await promptIterator.next();
+          if (initialPrompt.done) return { done: true, value: undefined };
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "raw-invoke-failed-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1 || step === 4) {
+          const attempt = step === 1 ? "first" : "second";
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: {
+                id: `msg-raw-only-${attempt}`,
+                role: "assistant",
+                stop_reason: "end_turn",
+                content: [
+                  {
+                    type: "text",
+                    text: '<invoke name="Bash"><parameter name="command">printf test</parameter></invoke>',
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (step === 2 || step === 5) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              session_id: "raw-invoke-failed-session",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          const retryPrompt = await promptIterator.next();
+          if (retryPrompt.done) return { done: true, value: undefined };
+          retryMessages.push(retryPrompt.value);
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "hook_response",
+              session_id: "raw-invoke-failed-session",
+              hook_name: "ProtocolRetry",
+              hook_event: "ProtocolRetry",
+              stdout: "",
+              stderr: "",
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the check"));
+    const failure = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+
+    expect(failure?.error).toContain("malformed tool-call protocol");
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    expect(retryMessages).toHaveLength(1);
+  } finally {
+    await session.close();
+  }
+});
+
+test("fails closed when raw and structured tool names disagree", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        const messages: Record<string, unknown>[] = [
+          {
+            type: "system",
+            subtype: "init",
+            session_id: "raw-invoke-mismatch-session",
+            permissionMode: "default",
+            model: "opus",
+          },
+          {
+            type: "assistant",
+            message: {
+              id: "msg-raw-mismatch",
+              role: "assistant",
+              stop_reason: "tool_use",
+              content: [
+                {
+                  type: "text",
+                  text: '<invoke name="Bash"><parameter name="command">printf test</parameter></invoke>',
+                },
+                {
+                  type: "tool_use",
+                  id: "toolu-raw-mismatch",
+                  name: "Read",
+                  input: { file_path: "README.md" },
+                },
+              ],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            session_id: "raw-invoke-mismatch-session",
+            usage: buildUsage(),
+            total_cost_usd: 0,
+          },
+        ];
+        if (step >= messages.length) return { done: true, value: undefined };
+        return { done: false, value: messages[step++] };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the check"));
+    const assistantText = events
+      .filter(
+        (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+          event.type === "timeline" && event.item.type === "assistant_message",
+      )
+      .map((event) => event.item.text)
+      .join("");
+    const failure = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+
+    expect(failure?.error).toContain("tool names disagree");
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    expect(assistantText).not.toContain("<invoke");
+  } finally {
+    await session.close();
+  }
+});
+
 test("preserves bypass capability across query restarts triggered by thinking changes", async () => {
   const capturedOptions: Array<{
     permissionMode?: string;
